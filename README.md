@@ -1,6 +1,6 @@
 # Uncensoring Project Maya (GLM-5.3-Flash / Maya S24)
 
-> A complete guide on removing refusal directions from **GLM-5.3-Flash** when using the **Project Maya** inference engine (including quants such as `Maya-S24`, `Maya-S`, `Maya-M`, etc.) using **in-flight directional refusal ablation (orthogonal projection)** without touching or re-quantizing the weights on disk.
+> A complete guide on removing refusal directions from **GLM-5.3-Flash** when using the **Project Maya** inference engine (including quants such as `Maya-S24`, `Maya-S`, `Maya-M`, etc.) using **in-flight directional refusal ablation (orthogonal projection)** without modifying or re-quantizing the weights on disk.
 
 ---
 
@@ -11,9 +11,8 @@
 - [C++ / CUDA Kernel Overview](#c--cuda-kernel-overview)
 - [Step-by-Step Guide](#step-by-step-guide)
   - [1. Download the Refusal Vector](#1-download-the-refusal-vector)
-  - [2. Runtime Environment Variables](#2-runtime-environment-variables)
-  - [3. Standalone Engine Configuration](#3-standalone-engine-configuration)
-  - [4. Llama-Swap Integration](#4-llama-swap-integration)
+  - [2. Launch Command](#2-launch-command)
+  - [3. (Optional) Launching with a JSON Configuration File](#3-optional-launching-with-a-json-configuration-file)
 - [Verification & Expected Logs](#verification--expected-logs)
 - [Troubleshooting & FAQ](#troubleshooting--faq)
 - [Credits & References](#credits--references)
@@ -45,7 +44,7 @@ Where:
 - $\mathbf{v}$ is a unit vector representing the refusal direction for that layer.
 - $\text{scale}$ controls the projection strength (`1.0` removes 100% of the refusal component).
 
-Because the residual stream writes are linear combinations, projecting the directions out of the block outputs ensures every subsequent state remains orthogonal to the refusal direction.
+Because residual stream writes are linear combinations, projecting the directions out of the block outputs ensures every subsequent state remains orthogonal to the refusal direction.
 
 ---
 
@@ -78,7 +77,7 @@ __global__ void rows_kernel(float* __restrict__ X, const float* __restrict__ V, 
 }
 ```
 
-The operation runs in shared memory with virtually zero compute overhead compared to the dense matrix multiplication of the model.
+The operation executes in GPU shared memory with virtually zero compute overhead.
 
 ---
 
@@ -104,30 +103,50 @@ ls -lh glm53-refusal-per-block-3dir.layers45.f32
 
 ---
 
-### 2. Runtime Environment Variables
+### 2. Launch Command
 
-The engine detects whether ablation is active through standard environment variables:
+Set the environment variables and run Project Maya directly:
 
-| Variable | Recommended Value | Purpose |
-| :--- | :--- | :--- |
-| `STRATA_GLM_ABLATE` | `/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32` | Path to the `.f32` vector file. |
-| `STRATA_GLM_ABLATE_LAYERS` | `45` | Enables per-layer mode for all 45 transformer blocks. |
-| `STRATA_GLM_ABLATE_SCALE` | `1.0` | Strength multiplier (`1.0` is standard full ablation). |
-
-To test via shell:
 ```bash
+# 1. Enable in-flight refusal ablation
 export STRATA_GLM_ABLATE="/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32"
 export STRATA_GLM_ABLATE_LAYERS="45"
 export STRATA_GLM_ABLATE_SCALE="1.0"
 
-./build/strata --glm-pack /models/Maya-S24/pack --max-context 131072
+# 2. Launch Project Maya server
+./maya.sh --port 8080
 ```
+
+> **One-liner command:**
+> ```bash
+> STRATA_GLM_ABLATE="/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32" \
+> STRATA_GLM_ABLATE_LAYERS="45" \
+> STRATA_GLM_ABLATE_SCALE="1.0" \
+> ./maya.sh --port 8080
+> ```
 
 ---
 
-### 3. Standalone Engine Configuration
+### 3. (Optional) Launching with a JSON Configuration File
 
-If you run Project Maya using a JSON profile (e.g. `strata_config_uncensored.json`), pass the variables directly into the `"env"` block:
+If you use a customized configuration file (e.g. `strata_config_uncensored.json`) for custom layer splits or dual-GPU setups:
+
+```bash
+# Set your environment variables
+export STRATA_GLM_ABLATE="/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32"
+export STRATA_GLM_ABLATE_LAYERS="45"
+export STRATA_GLM_ABLATE_SCALE="1.0"
+
+# Launch the server with the custom configuration
+.venv/bin/python3 -m serve.server \
+  --engine strata \
+  --fit-max-tokens \
+  --config strata_config_uncensored.json \
+  --host 0.0.0.0 \
+  --port 8080
+```
+
+Or define the environment variables directly inside `strata_config_uncensored.json`:
 
 ```json
 {
@@ -153,7 +172,7 @@ If you run Project Maya using a JSON profile (e.g. `strata_config_uncensored.jso
   "tokenizer": "/models/Maya-S24/pack/tokenizer",
   "model_name": "Maya-S24-Uncensored",
   "host": "0.0.0.0",
-  "port": 8088,
+  "port": 8080,
   "gpu": "0,1",
   "env": {
     "STRATA_GLM_RAM_RESIDENT": "1",
@@ -173,52 +192,16 @@ If you run Project Maya using a JSON profile (e.g. `strata_config_uncensored.jso
 
 ---
 
-### 4. Llama-Swap Integration
-
-If you use [llama-swap](https://github.com/mostlygeek/llama-swap) to multiplex models on demand, define an uncensored model alias alongside the standard model in `config.yaml`:
-
-```yaml
-listen: "0.0.0.0:8080"
-ttl: 3600
-
-models:
-  maya-s24:
-    aliases:
-      - "Maya-S24"
-      - "maya"
-      - "glm-5.3-flash-maya"
-    cmd: >-
-      /home/maxbozza/project-maya/run-maya-swap.sh
-      /home/maxbozza/project-maya/strata_config.json
-      ${PORT}
-
-  maya-s24-uncensored:
-    aliases:
-      - "Maya-S24-Uncensored"
-      - "maya-uncensored"
-      - "glm-5.3-uncensored"
-      - "GLM-5.3-Flash-Uncensored"
-      - "maya-ablated"
-    cmd: >-
-      /home/maxbozza/project-maya/run-maya-swap.sh
-      /home/maxbozza/project-maya/strata_config_uncensored.json
-      ${PORT}
-```
-
-Now requests specifying `"model": "maya-uncensored"` will dynamically load Maya with refusal ablation active.
-
----
-
 ## 🔍 Verification & Expected Logs
 
-When starting the engine, inspect `/tmp/strata_engine.log` or standard error output:
+When starting the engine, inspect the console output:
 
 ```text
 glm ablate: 552960 values from /models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32 (norm^2 135.0000), per layer, scale 1.00
 ```
 
-- If you see `glm ablate: ...`, the CUDA kernel is compiled, uploaded to device memory, and active on every residual stream write.
-- If you see `glm ablate: cannot open ... - running the stock model`, verify file paths and permissions.
+- When `glm ablate: ...` appears, the kernel is active and applying the orthogonal projection to all residual stream writes.
+- If you see `glm ablate: cannot open ... - running the stock model`, check the vector file path and permissions.
 
 ---
 
