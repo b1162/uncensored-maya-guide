@@ -1,30 +1,35 @@
 # Uncensoring Project Maya (GLM-5.3-Flash / Maya S24)
 
-> A complete guide on removing refusal directions from **GLM-5.3-Flash** when using the **Project Maya** inference engine (including quants such as `Maya-S24`, `Maya-S`, `Maya-M`, etc.) using **in-flight directional refusal ablation (orthogonal projection)** without modifying or re-quantizing the weights on disk.
+> A comprehensive technical guide and source code implementation for removing refusal directions from **GLM-5.3-Flash** inside the **Project Maya** / **Strata** inference engine (including quants such as `Maya-S24`, `Maya-S`, `Maya-M`, etc.) using **in-flight directional refusal ablation (orthogonal projection)** without modifying or re-quantizing the weights on disk.
 
 ---
 
 ## 📑 Table of Contents
 
-- [Why Not Re-Quantize?](#why-not-re-quantize)
+- [Why In-Flight Ablation Instead of Re-Quantization?](#why-in-flight-ablation-instead-of-re-quantization)
 - [How In-Flight Ablation Works](#how-in-flight-ablation-works)
-- [C++ / CUDA Kernel Overview](#c--cuda-kernel-overview)
+- [Source Code & Engine Integration References](#source-code--engine-integration-references)
+  - [1. CUDA Kernel: `src/core/glm_ablate.cuh`](#1-cuda-kernel-srccoreglm_ablatecuh)
+  - [2. Embedding Stream Injection](#2-embedding-stream-injection)
+  - [3. Per-Layer FFN Output & Stream Mix](#3-per-layer-ffn-output--stream-mix)
+  - [4. Final Layer mHC Update](#4-final-layer-mhc-update)
+- [Applying the Patch to Vanilla Project Maya](#applying-the-patch-to-vanilla-project-maya)
 - [Step-by-Step Guide](#step-by-step-guide)
   - [1. Download the Refusal Vector](#1-download-the-refusal-vector)
   - [2. Launch Command](#2-launch-command)
   - [3. (Optional) Launching with a JSON Configuration File](#3-optional-launching-with-a-json-configuration-file)
-- [Verification & Expected Logs](#verification--expected-logs)
+- [Verification & Expected Engine Logs](#verification--expected-engine-logs)
 - [Troubleshooting & FAQ](#troubleshooting--faq)
-- [Credits & References](#credits--references)
+- [Credits & Upstream Repositories](#credits--upstream-repositories)
 
 ---
 
-## ⚡ Why Not Re-Quantize?
+## ⚡ Why In-Flight Ablation Instead of Re-Quantization?
 
-Uncensoring models typically requires fine-tuning or applying abliteration scripts directly to weight checkpoints and re-quantizing them. For a 321B MoE architecture like **GLM-5.3-Flash**:
+Uncensoring models typically requires fine-tuning or applying offline abliteration scripts directly to weight checkpoints and re-quantizing them. For a 321B MoE architecture like **GLM-5.3-Flash**:
 
-1. **Massive Size**: Checkpoints are ~90–150 GB in quantized formats. Downloading or storing multiple duplicates wastes storage.
-2. **Quantization Degradation**: Converting or re-quantizing non-standard quantized layers can introduce perplexity degradation and break Maya's custom quantized format layouts.
+1. **Massive Size**: Checkpoints are ~90–150 GB in quantized formats. Storing duplicate quants wastes huge amounts of disk storage.
+2. **Quantization Degradation**: Converting or re-quantizing non-standard quantized layers introduces perplexity loss and breaks Maya's custom quantized format layouts.
 3. **Loss of Fast Paths**: Maya relies on tightly calibrated expert tiering across VRAM, RAM, and NVMe SSD. Incompatible quantizations break its native kernel optimizations.
 
 By removing refusal directions **in-flight** through residual stream orthogonal projection, we keep the original high-performance Maya quant untouched while achieving clean, uncensored responses.
@@ -42,20 +47,23 @@ $$\mathbf{x}' = \mathbf{x} - \text{scale} \cdot (\mathbf{x} \cdot \mathbf{v}) \m
 Where:
 - $\mathbf{x}$ is the residual stream activation vector for a token.
 - $\mathbf{v}$ is a unit vector representing the refusal direction for that layer.
-- $\text{scale}$ controls the projection strength (`1.0` removes 100% of the refusal component).
+- $\text{scale}$ controls projection strength (`1.0` removes 100% of the refusal component).
 
-Because residual stream writes are linear combinations, projecting the directions out of the block outputs ensures every subsequent state remains orthogonal to the refusal direction.
+Because residual stream writes in Maya's manifold hidden state (mHC) are linear combinations ($R = \text{post} \times \text{block\_out} + \text{comb} \cdot R$), projecting the directions out of the block outputs ensures every subsequent stream remains orthogonal to the refusal direction without altering any weights on disk.
 
 ---
 
-## 💻 C++ / CUDA Kernel Overview
+## 🔍 Source Code & Engine Integration References
 
-In Project Maya, the ablation logic is implemented in `src/core/glm_ablate.cuh`:
+The implementation files in Project Maya / Strata source tree:
+
+### 1. CUDA Kernel: `src/core/glm_ablate.cuh`
+The complete self-contained header is included in this repository at [`glm_ablate.cuh`](./glm_ablate.cuh).
 
 ```cuda
 namespace {
 __global__ void rows_kernel(float* __restrict__ X, const float* __restrict__ V, int E, int K, float scale) {
-    float* x = X + (size_t) blockIdx.x * E;
+    float* x = X + (size_t) blockIdx.x * E;   // one block per row, 256 threads; K directions
     __shared__ float red[256];
     const int tid = threadIdx.x;
     for (int k = 0; k < K; ++k) {
@@ -77,7 +85,47 @@ __global__ void rows_kernel(float* __restrict__ X, const float* __restrict__ V, 
 }
 ```
 
-The operation executes in GPU shared memory with virtually zero compute overhead.
+### 2. Embedding Stream Injection
+In `src/core/glm_prefill.cu` (prompt prefill) and `src/core/glm_model.cu` (decode / speculation):
+```cpp
+// Embedding lands in device memory and is projected before fanning out to the 4 mHC streams
+cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
+glm_ablate::rows(S->x, T, E, fast_->cs);   // STRATA_GLM_ABLATE
+gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+```
+
+### 3. Per-Layer FFN Output & Stream Mix
+In `src/core/glm_fast_path.cu` and `src/core/glm_prefill.cu`:
+```cpp
+if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
+    glm_ablate::layer_rows(il - 1, F->ffn, 1, g.n_embd, s);
+    glm_ablate::layer_rows(il - 1, Rc, g.hc, g.n_embd, s);
+}
+```
+
+### 4. Final Layer mHC Update
+```cpp
+// Last layer write: project mixer and FFN before final combine
+glm_ablate::rows(S->ffn, T, E, s);   // STRATA_GLM_ABLATE
+glm_ablate::layer_rows(l1_ - 1, S->ffn, T, E, s);
+glm_ablate::layer_rows(l1_ - 1, S->R, 4 * T, E, s);
+gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+```
+
+---
+
+## 📦 Applying the Patch to Vanilla Project Maya
+
+If your build of Project Maya does not yet include `glm_ablate`, apply the unified patch provided in this repo:
+
+```bash
+cd /path/to/project-maya
+git apply /path/to/ablation_patch.diff
+# Rebuild the strata engine
+cmake --build build -j
+```
+
+The unified patch file is available directly in this repo: [`ablation_patch.diff`](./ablation_patch.diff).
 
 ---
 
@@ -117,7 +165,7 @@ export STRATA_GLM_ABLATE_SCALE="1.0"
 ./maya.sh --port 8080
 ```
 
-> **One-liner command:**
+> **One-liner execution:**
 > ```bash
 > STRATA_GLM_ABLATE="/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32" \
 > STRATA_GLM_ABLATE_LAYERS="45" \
@@ -129,15 +177,13 @@ export STRATA_GLM_ABLATE_SCALE="1.0"
 
 ### 3. (Optional) Launching with a JSON Configuration File
 
-If you use a customized configuration file (e.g. `strata_config_uncensored.json`) for custom layer splits or dual-GPU setups:
+If you run with a custom JSON configuration file (e.g. for dual-GPU layer split tuning):
 
 ```bash
-# Set your environment variables
 export STRATA_GLM_ABLATE="/models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32"
 export STRATA_GLM_ABLATE_LAYERS="45"
 export STRATA_GLM_ABLATE_SCALE="1.0"
 
-# Launch the server with the custom configuration
 .venv/bin/python3 -m serve.server \
   --engine strata \
   --fit-max-tokens \
@@ -146,8 +192,7 @@ export STRATA_GLM_ABLATE_SCALE="1.0"
   --port 8080
 ```
 
-Or define the environment variables directly inside `strata_config_uncensored.json`:
-
+Example `strata_config_uncensored.json`:
 ```json
 {
   "exe": "/home/maxbozza/project-maya/build/strata",
@@ -192,16 +237,16 @@ Or define the environment variables directly inside `strata_config_uncensored.js
 
 ---
 
-## 🔍 Verification & Expected Logs
+## 🔍 Verification & Expected Engine Logs
 
-When starting the engine, inspect the console output:
+On engine boot, check the console output or `/tmp/strata_engine.log`:
 
 ```text
 glm ablate: 552960 values from /models/Maya-S24/vector/glm53-refusal-per-block-3dir.layers45.f32 (norm^2 135.0000), per layer, scale 1.00
 ```
 
-- When `glm ablate: ...` appears, the kernel is active and applying the orthogonal projection to all residual stream writes.
-- If you see `glm ablate: cannot open ... - running the stock model`, check the vector file path and permissions.
+- When this line appears, the CUDA kernel is active and removing refusal directions on all residual stream writes.
+- If you see `glm ablate: cannot open ... - running the stock model`, check file paths and read permissions.
 
 ---
 
@@ -218,8 +263,9 @@ Yes. Adjust `STRATA_GLM_ABLATE_SCALE`:
 
 ---
 
-## 📜 Credits & References
+## 📜 Credits & Upstream Repositories
 
 - [Project Maya](https://github.com/mw00/project-maya) by mw00 and PeasantSmith.
+- [Strata](https://github.com/Niko1221/Strata) by Niko1221.
 - [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) by Z.ai.
 - Refusal direction extraction & vector by [alesha-pro](https://huggingface.co/alesha-pro/GLM-5.3-Flash-abliterated-Maya-M-GGUF).

@@ -1,0 +1,430 @@
+diff --git a/src/core/glm_ablate.cuh b/src/core/glm_ablate.cuh
+new file mode 100644
+index 0000000..73ea58d
+--- /dev/null
++++ b/src/core/glm_ablate.cuh
+@@ -0,0 +1,145 @@
++// src/core/glm_ablate.cuh - STRATA_GLM_ABLATE=<file>: directions projected out of the GLM path's residual streams
++// (research; off unless the variable is set).  The file is raw float32.
++//
++// Outputs mode (default): K * n_embd values, K orthonormal vectors.  The token embedding and every block output (the
++// mixer's and the FFN's) become x - scale (x . v) v before the mHC write.  The mHC streams are only ever linear
++// mixes of those rows (R = post x block_out + comb . R), so every stream stays orthogonal to the vectors: the same
++// effect as orthogonalizing every matrix that writes into the stream, without requantizing anything.
++//
++// Per-layer mode (STRATA_GLM_ABLATE_LAYERS=<n_layers>): n_layers * K * n_embd values, layer l's own K orthonormal
++// vectors (all zero = the layer is not steered).  After layer l's FFN write every stream loses its components along
++// layer l's vectors - done on the two operands of that write (the FFN output and the streams it is mixed into), so
++// the fused read needs no change.  The same operation as exllamav3's EXL3_CVEC hook after each block.
++//
++// The NextN draft block is left alone (a draft only has to be a good guess).  STRATA_GLM_ABLATE_SCALE (default 1).
++#pragma once
++
++#include <cuda_runtime.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
++namespace glm_ablate {
++
++namespace {
++__global__ void rows_kernel(float* __restrict__ X, const float* __restrict__ V, int E, int K, float scale) {
++    float* x = X + (size_t) blockIdx.x * E;   // one block a row, 256 threads; the K directions one after another
++    __shared__ float red[256];
++    const int tid = threadIdx.x;
++    for (int k = 0; k < K; ++k) {
++        const float* v = V + (size_t) k * E;
++        float acc = 0.0f;
++        for (int e = tid; e < E; e += 256) acc += x[e] * v[e];
++        red[tid] = acc;
++        __syncthreads();
++        for (int n = 128; n > 0; n >>= 1) {
++            if (tid < n) red[tid] += red[tid + n];
++            __syncthreads();
++        }
++        const float c = red[0] * scale;
++        __syncthreads();
++        for (int e = tid; e < E; e += 256) x[e] -= c * v[e];
++        __syncthreads();
++    }
++}
++}  // namespace
++
++struct State {
++    bool on = false;
++    int layers = 0;               // > 0: per-layer mode, the file holds this many layers
++    std::vector<char> steered;    // per-layer mode: the layer has a non-zero direction
++    float scale = 1.0f;
++    std::vector<float> host;
++    std::mutex mu;
++    float* dev[64] = {};
++};
++
++inline State& state() {
++    static State s;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        const char* path = getenv("STRATA_GLM_ABLATE");
++        if (path == nullptr || !path[0]) return;
++        std::FILE* f = std::fopen(path, "rb");
++        if (f == nullptr) {
++            std::fprintf(stderr, "glm ablate: cannot open %s - running the stock model\n", path);
++            return;
++        }
++        std::fseek(f, 0, SEEK_END);
++        const long bytes = std::ftell(f);
++        std::fseek(f, 0, SEEK_SET);
++        s.host.resize((size_t) bytes / sizeof(float));
++        const size_t got = std::fread(s.host.data(), sizeof(float), s.host.size(), f);
++        std::fclose(f);
++        if (got != s.host.size() || s.host.empty()) {
++            std::fprintf(stderr, "glm ablate: %s is not a float32 vector - running the stock model\n", path);
++            return;
++        }
++        if (const char* sc = getenv("STRATA_GLM_ABLATE_SCALE")) s.scale = (float) std::atof(sc);
++        if (const char* ly = getenv("STRATA_GLM_ABLATE_LAYERS")) s.layers = std::atoi(ly);
++        if (s.layers > 0) {
++            if (s.host.size() % (size_t) s.layers != 0) {
++                std::fprintf(stderr, "glm ablate: %s does not hold %d layers - running the stock model\n", path, s.layers);
++                return;
++            }
++            const size_t per = s.host.size() / (size_t) s.layers;
++            s.steered.assign((size_t) s.layers, 0);
++            for (int l = 0; l < s.layers; ++l)
++                for (size_t i = 0; i < per; ++i)
++                    if (s.host[(size_t) l * per + i] != 0.0f) { s.steered[(size_t) l] = 1; break; }
++        }
++        double nn = 0.0;
++        for (float x : s.host) nn += (double) x * x;
++        s.on = true;
++        std::fprintf(stderr, "glm ablate: %zu values from %s (norm^2 %.4f), %s, scale %.2f\n", s.host.size(), path, nn,
++                     s.layers > 0 ? "per layer" : "block outputs", s.scale);
++    });
++    return s;
++}
++
++inline bool on() { return state().on; }
++
++/// The table on the CURRENT device (uploaded on first use), or nullptr when off or of another width.
++inline const float* vec(int E) {
++    State& a = state();
++    if (!a.on || E <= 0 || a.host.size() % (size_t) E != 0) return nullptr;
++    if (a.layers > 0 && a.host.size() % ((size_t) a.layers * (size_t) E) != 0) return nullptr;
++    int d = 0;
++    if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= 64) return nullptr;
++    std::lock_guard<std::mutex> lk(a.mu);
++    if (a.dev[d] == nullptr) {
++        float* p = nullptr;
++        if (cudaMalloc((void**) &p, a.host.size() * sizeof(float)) != cudaSuccess ||
++            cudaMemcpy(p, a.host.data(), a.host.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
++            std::fprintf(stderr, "glm ablate: no memory for the direction on CUDA%d - ablation OFF\n", d);
++            a.on = false;
++            return nullptr;
++        }
++        a.dev[d] = p;
++    }
++    return a.dev[d];
++}
++
++/// Outputs mode: T rows of E values at X (row stride E): x <- x - scale (x . v) v for the file's vectors.
++inline void rows(float* X, int T, int E, cudaStream_t s) {
++    State& a = state();
++    if (!a.on || a.layers > 0 || X == nullptr || T <= 0) return;
++    const float* v = vec(E);
++    if (v == nullptr) return;
++    rows_kernel<<<T, 256, 0, s>>>(X, v, E, (int) (a.host.size() / (size_t) E), a.scale);
++}
++
++/// Per-layer mode: the same on T rows with layer `layer`'s vectors (no-op in outputs mode or for an unsteered layer).
++inline void layer_rows(int layer, float* X, int T, int E, cudaStream_t s) {
++    State& a = state();
++    if (!a.on || a.layers <= 0 || layer < 0 || layer >= a.layers || !a.steered[(size_t) layer] || X == nullptr || T <= 0)
++        return;
++    const float* v = vec(E);
++    if (v == nullptr) return;
++    const int K = (int) (a.host.size() / ((size_t) a.layers * (size_t) E));
++    rows_kernel<<<T, 256, 0, s>>>(X, v + (size_t) layer * K * E, E, K, a.scale);
++}
++
++}  // namespace glm_ablate
+diff --git a/src/core/glm_fast_path.cu b/src/core/glm_fast_path.cu
+index ea01cf0..2454a6a 100644
+--- a/src/core/glm_fast_path.cu
++++ b/src/core/glm_fast_path.cu
+@@ -16,6 +16,7 @@
+ // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
+ // resident experts are excluded, and every other layer's slots are untouched.
+ #include "glm_fast_state.hpp"
++#include "glm_ablate.cuh"
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/glm_model.hpp"
+ #include "strata/kernels/glm_fast.hpp"
+@@ -650,11 +651,19 @@ bool Glm5Model::fast_setup(std::string& err) {
+         const std::string P = "blk." + std::to_string(il) + ".";
+         const auto f32 = [&](const char* n) -> const float* {
+             auto it = w_.find(P + n);
++            if (it == w_.end()) {
++                if (std::strcmp(n, "indexer_compressor_ape.weight") == 0) it = w_.find(P + "indexer.pool_ape.weight");
++                else if (std::strcmp(n, "indexer_compressor_gate.weight") == 0) it = w_.find(P + "indexer.pool_gate.weight");
++            }
+             if (it == w_.end()) { missing += P + n + " (f32) "; return nullptr; }
+             return it->second;
+         };
+         const auto b16 = [&](const char* n) -> const uint16_t* {
+             auto it = w16_.find(P + n);
++            if (it == w16_.end()) {
++                if (std::strcmp(n, "indexer_compressor_gate.weight") == 0) it = w16_.find(P + "indexer.pool_gate.weight");
++                else if (std::strcmp(n, "indexer_compressor_ape.weight") == 0) it = w16_.find(P + "indexer.pool_ape.weight");
++            }
+             if (it == w16_.end()) { missing += P + n + " (bf16) "; return nullptr; }
+             return it->second;
+         };
+@@ -873,6 +882,7 @@ bool Glm5Model::fast_setup(std::string& err) {
+     }
+     if (mtp_il_ >= 0) {
+         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
++            cudaMalloc(&F->mtp_catf, (size_t) 2 * g.n_embd * sizeof(float)) != cudaSuccess ||
+             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
+             cudaMalloc(&F->mtp_logits, (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
+             cudaMalloc(&F->mtp_tok, 64) != cudaSuccess ||
+@@ -979,6 +989,7 @@ bool Glm5Model::fast_setup(std::string& err) {
+         // --expert-cache auto: the budget checked once written, before the prompt path sizes its chunk from it
+         pool_check(floor_b, stride_max, all_b);
+         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
++        (void) glm_ablate::vec((int) g_.n_embd);   // STRATA_GLM_ABLATE: the direction on this device, before the pool is sized
+         if (!prefill_setup(err)) return false;
+         size_t free_b = 0, total_b = 0;
+         cudaMemGetInfo(&free_b, &total_b);
+@@ -3326,6 +3337,7 @@ void Glm5Model::fast_destroy() {
+     if (F->tok_h) cudaFreeHost(F->tok_h);
+     if (F->scratch) cudaFree(F->scratch);
+     if (F->mtp_h) cudaFree(F->mtp_h);
++    if (F->mtp_catf) cudaFree(F->mtp_catf);
+     if (F->mtp_catq) cudaFree(F->mtp_catq);
+     if (F->mtp_logits) cudaFree(F->mtp_logits);
+     if (F->mtp_tok) cudaFree(F->mtp_tok);
+@@ -4908,6 +4920,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
+         if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
+         const auto body = [&]() -> bool {
+         // ---- the attention-side read (fused with the previous FFN's write)
++        if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
++            glm_ablate::layer_rows(il - 1, F->ffn, 1, g.n_embd, s);
++            glm_ablate::layer_rows(il - 1, Rc, g.hc, g.n_embd, s);
++        }
+         gf::HcArgs h;
+         h.block_out = il == l0_ ? nullptr : F->ffn;
+         h.R_old = Rc;
+@@ -4988,6 +5004,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
+         }
+ 
+         // ---- the FFN-side read (fused with the mixer's write)
++        glm_ablate::rows(F->mixer, 1, g.n_embd, s);   // STRATA_GLM_ABLATE: the mixer's write
+         h.block_out = F->mixer;
+         h.R_old = Rc;
+         h.R_new = Ro;
+@@ -5020,6 +5037,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
+         } else {
+             if (!fast_moe(il, pf_pending, err)) return false;
+         }
++        glm_ablate::rows(F->ffn, 1, g.n_embd, s);   // STRATA_GLM_ABLATE: the FFN's write
+         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
+         return true;
+         };
+@@ -5042,6 +5060,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
+         if (const int fe = glmfast::submit_every(); fe > 0 && (il - l0_) % fe == 0) glmfast::submit_queued(s);
+     }
+     // the last layer's write half: R (in the OTHER buffer) = post x ffn + comb . R
++    glm_ablate::layer_rows(l1_ - 1, F->ffn, 1, g.n_embd, s);   // STRATA_GLM_ABLATE per layer
++    glm_ablate::layer_rows(l1_ - 1, Rc, g.hc, g.n_embd, s);
+     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
+     if (F->prof_on) F->mark("hc_post_end");
+     // keep the convention "the residual lives at state_" for the hop and the head: copy back
+@@ -5080,6 +5100,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
+                  g.n_embd);
+     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
+     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
++    glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
+     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+     if (!fast_layers(p, false, err)) return false;
+     // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
+@@ -5219,19 +5240,32 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
+             cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+         }
+     }
+-    gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
+-    gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
++    auto mtp_sync = [&](const char* tag) {
++        cudaError_t e = cudaStreamSynchronize(s);
++        if (e != cudaSuccess) {
++            std::fprintf(stderr, "MTP CHECKPOINT %s: %s\n", tag, cudaGetErrorString(e));
++        }
++    };
++    gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, F->mtp_catf, s);
++    mtp_sync("mtp_in");
++    gf::MvJob eh = {Ly.eh.q, F->mtp_catq, F->mtp_catf, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
+     if (!gf::mv(&eh, 1, s)) {
+         err = "glm mtp: eh_proj";
+         return false;
+     }
++    mtp_sync("eh_proj");
+     gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
+-    if (glmfast::submit_every() > 0) glmfast::submit_queued(s);   // (Windows HIP: the GPU starts while the rest queues)
++    mtp_sync("attn_norm");
++    if (glmfast::submit_every() > 0) glmfast::submit_queued(s);
+     if (!fast_dsa(il, p, err)) return false;
++    mtp_sync("fast_dsa");
+     gf::rms_q8(F->mtp_h, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
++    mtp_sync("ffn_norm");
+     bool pf_pending = false;
+     if (!fast_moe(il, pf_pending, err)) return false;
++    mtp_sync("fast_moe");
+     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
++    mtp_sync("shnorm");
+     const WSlot& ow = ws_map_.at("output.weight");
+     gf::MvJob o[2];
+     o[0] = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+@@ -5580,6 +5614,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
+                  g.n_embd);
+     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
+     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
++    glm_ablate::rows(F->emb, 1, g.n_embd, F->cs);   // STRATA_GLM_ABLATE
+     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
+     lap(2);
+     if (cancellable) {
+diff --git a/src/core/glm_model.cu b/src/core/glm_model.cu
+index 373a0a3..0b5e156 100644
+--- a/src/core/glm_model.cu
++++ b/src/core/glm_model.cu
+@@ -217,8 +217,14 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind,
+         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
+     }
+     if (how) *how = " q" + std::to_string((int) t->type);
+-    return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+-           ~(uint64_t) 255u;
++    try {
++        return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
++               ~(uint64_t) 255u;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "pack_row_vram failed for %s type %d (shape %ld x %ld): %s\n",
++                     name.c_str(), (int) t->type, (long) t->shape[0], (long) t->shape[1], e.what());
++        throw;
++    }
+ }
+ 
+ // the NextN draft block's dense tensors (blk.<n_layers>.*) as load_mtp keeps them: natively served, BF16, F32
+@@ -528,6 +534,9 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
+     // the layer-type array: 0 marks a KDA (recurrent) layer
+     out.n_head_kv.assign((size_t) out.n_layers, 0);
+     arr_i("attention.head_count_kv", out.n_head_kv, out.n_layers);
++    if (std::all_of(out.n_head_kv.begin(), out.n_head_kv.end(), [](int x) { return x == 0; })) {
++        arr_i("layer_types", out.n_head_kv, out.n_layers);
++    }
+ 
+     // the per-layer indexer type (glm5-next.cpp L46-47: optional array, absent means every layer
+     // is full; a non-full DSA layer carries no indexer tensors and reuses the previous full
+@@ -558,7 +567,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
+     // GGUF's metadata contract is off (deepseek2 convention: key_length = kv_lora + rope)
+     if (const auto* v = g.get(p + "attention.key_length")) {
+         const double key_length = v->is_num() ? v->num() : (v->items.empty() ? -1 : v->items[0].num());
+-        if (key_length != (double) out.kv_lora) {
++        if (key_length != (double) out.kv_lora && key_length != (double) out.qk_nope) {
+             err = "glm5_model: attention.key_length " + std::to_string(key_length) +
+                   " != kv_lora_rank " + std::to_string(out.kv_lora) +
+                   " (nope-only MLA holds the bare latent; a rope tail is not supported)";
+@@ -1984,8 +1993,18 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
+     for (int il = l0_; il < l1_; ++il) {
+         if (timing_ && !tev_rec(tev_a_, "a")) timing_ = false;
+         const std::string L = std::to_string(il);
+-        const auto W = [&](const char* suffix) { return w_.at("blk." + L + "." + suffix); };
+-        const auto ws_ = [&](const std::string& suffix) -> WSlot& { return ws_map_.at("blk." + L + "." + suffix); };
++        const auto W = [&](const char* suffix) {
++            auto it = w_.find("blk." + L + "." + suffix);
++            if (it != w_.end()) return it->second;
++            if (std::strcmp(suffix, "indexer_compressor_ape.weight") == 0) return w_.at("blk." + L + ".indexer.pool_ape.weight");
++            return w_.at("blk." + L + "." + suffix);
++        };
++        const auto ws_ = [&](const std::string& suffix) -> WSlot& {
++            auto it = ws_map_.find("blk." + L + "." + suffix);
++            if (it != ws_map_.end()) return it->second;
++            if (suffix == "indexer_compressor_gate.weight") return ws_map_.at("blk." + L + ".indexer.pool_gate.weight");
++            return ws_map_.at("blk." + L + "." + suffix);
++        };
+ 
+         // ---- hc read + norm
+         strata::kernels::glm_hc_pre(R, W("hc_attn_fn.weight"), W("hc_attn_scale.weight"),
+@@ -2939,6 +2958,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
+             }
+             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
++            if (r.name.find("indexer.pool_gate.weight") != std::string::npos) {
++                std::string a = r.name;
++                a.replace(a.find("indexer.pool_gate.weight"), 24, "indexer_compressor_gate.weight");
++                w16_[a] = w16_[r.name];
++            }
+             at += (r.bytes + 255u) & ~(uint64_t) 255u;
+             continue;
+         }
+@@ -3014,6 +3038,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
+                             cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
+         ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
++        if (r.name.find("indexer.pool_ape.weight") != std::string::npos) {
++            std::string a = r.name;
++            a.replace(a.find("indexer.pool_ape.weight"), 23, "indexer_compressor_ape.weight");
++            w_[a] = w_[r.name];
++            ws_map_[a] = ws_map_[r.name];
++        }
+         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
+     }
+ 
+diff --git a/src/core/glm_prefill.cu b/src/core/glm_prefill.cu
+index 206be8c..2461b92 100644
+--- a/src/core/glm_prefill.cu
++++ b/src/core/glm_prefill.cu
+@@ -17,6 +17,7 @@
+ // routing also feeds the expert tiers' LFU counts, so the decode that follows starts from this conversation's
+ // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
+ #include "glm_fast_state.hpp"
++#include "glm_ablate.cuh"
+ 
+ #include "strata/core/progress.hpp"
+ #include "strata/kernels/cpu/kq_avx512.hpp"
+@@ -1390,6 +1391,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
+     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
+     const auto hc_read = [&](const float* block_out, const uint16_t* fn, const float* scale, const float* base,
+                              const float* norm) {
++        glm_ablate::rows(const_cast<float*>(block_out), T, E, s);   // STRATA_GLM_ABLATE (nullptr: no write)
+         gb::hc_update(block_out, S->R, S->post, S->comb, S->ss, T, E, s);
+         sgemm_bf16(fn, 24, 4 * E, S->R, 4 * E, S->mix, 24, T, 1.0f);
+         gb::HcFinishArgs h;
+@@ -1715,6 +1717,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
+         const auto& Ly = F->L[(size_t) il];
+         const bool skip_output = tail_skip && il == g.n_layers - 1;
+         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
++        if (il != l0_) {   // STRATA_GLM_ABLATE per layer: both operands of layer il - 1's FFN write
++            glm_ablate::layer_rows(il - 1, S->ffn, T, E, s);
++            glm_ablate::layer_rows(il - 1, S->R, 4 * T, E, s);
++        }
+         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
+         S->mark("hc", s);
+         // S->R: the layer's input rows - the DFlash drafter's features when it reads this layer (the stream means go
+@@ -2854,6 +2860,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
+     }
+     // the last layer's write half: R = post x ffn + comb . R
+     if (!tail_skip) {
++        glm_ablate::rows(S->ffn, T, E, s);   // STRATA_GLM_ABLATE
++        glm_ablate::layer_rows(l1_ - 1, S->ffn, T, E, s);
++        glm_ablate::layer_rows(l1_ - 1, S->R, 4 * T, E, s);
+         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
+         S->mark("hc", s);
+     }
+@@ -3185,6 +3194,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
+         }
+         // the embedding lands in x (free until the first layer's gates write it) and fans out to the 4 streams
+         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
++        glm_ablate::rows(S->x, T, E, fast_->cs);   // STRATA_GLM_ABLATE
+         gb::embed_rows(S->x, S->R, T, E, fast_->cs);
+         return true;
+     };
